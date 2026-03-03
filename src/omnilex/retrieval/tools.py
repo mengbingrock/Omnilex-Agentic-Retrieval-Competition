@@ -4,9 +4,17 @@ These tools are designed to be used with ReAct-style agents or
 LangChain-compatible tool interfaces.
 """
 
-from typing import Protocol, runtime_checkable
+from __future__ import annotations
+
+import logging
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from .bm25_index import BM25Index
+
+if TYPE_CHECKING:
+    from omnilex.graph.retriever import CitationGraphRetriever
+
+logger = logging.getLogger(__name__)
 
 
 @runtime_checkable
@@ -43,12 +51,14 @@ Example queries: "contract formation requirements", "Vertragsabschluss", "divorc
     def __init__(
         self,
         index: SearchIndex | BM25Index,
+        index: SearchIndex | BM25Index,
         top_k: int = 5,
         max_excerpt_length: int = 300,
     ):
         """Initialize law search tool.
 
         Args:
+            index: Search index for federal laws (BM25Index or EmbeddingIndex)
             index: Search index for federal laws (BM25Index or EmbeddingIndex)
             top_k: Number of results to return
             max_excerpt_length: Maximum characters for text excerpts
@@ -140,12 +150,14 @@ Example queries: "negligence standard of care", "Sorgfaltspflicht", "contract in
     def __init__(
         self,
         index: SearchIndex | BM25Index,
+        index: SearchIndex | BM25Index,
         top_k: int = 5,
         max_excerpt_length: int = 300,
     ):
         """Initialize court search tool.
 
         Args:
+            index: Search index for court decisions (BM25Index or EmbeddingIndex)
             index: Search index for court decisions (BM25Index or EmbeddingIndex)
             top_k: Number of results to return
             max_excerpt_length: Maximum characters for text excerpts
@@ -236,12 +248,16 @@ Use this for comprehensive research when you need both statutory law and case la
         self,
         law_index: SearchIndex | BM25Index,
         court_index: SearchIndex | BM25Index,
+        law_index: SearchIndex | BM25Index,
+        court_index: SearchIndex | BM25Index,
         top_k_each: int = 3,
         max_excerpt_length: int = 250,
     ):
         """Initialize combined search tool.
 
         Args:
+            law_index: Search index for federal laws (BM25Index or EmbeddingIndex)
+            court_index: Search index for court decisions (BM25Index or EmbeddingIndex)
             law_index: Search index for federal laws (BM25Index or EmbeddingIndex)
             court_index: Search index for court decisions (BM25Index or EmbeddingIndex)
             top_k_each: Number of results from each corpus
@@ -292,6 +308,110 @@ Use this for comprehensive research when you need both statutory law and case la
         return "\n".join(output)
 
 
+class CitationExplorerTool:
+    """Tool for exploring citation relationships of a specific law or case.
+
+    Given a citation ID (law provision or court decision), queries the Neo4j
+    citation graph to find:
+    1. What cites this entity most (top inbound citations by TF-IDF weight)
+    2. What this entity cites most (top outbound citations by TF-IDF weight)
+    """
+
+    name: str = "explore_citations"
+    description: str = """Explore citation relationships of a specific law or court decision.
+Input: A citation ID (e.g. "Art. 34 BV", "BGE 139 I 2")
+Output: Two lists — what cites this entity most, and what this entity cites most.
+
+Use this tool to understand the citation network around a known law or case.
+Example inputs: "Art. 41 Abs. 1 OR", "BGE 145 II 32", "Art. 1 ZGB"
+"""
+
+    def __init__(
+        self,
+        graph_retriever: CitationGraphRetriever,
+        top_k: int = 5,
+    ):
+        """Initialize citation explorer tool.
+
+        Args:
+            graph_retriever: Neo4j graph retriever for citation queries
+            top_k: Number of results per direction (inbound + outbound)
+        """
+        self.graph_retriever = graph_retriever
+        self.top_k = top_k
+
+    def __call__(self, citation_id: str) -> str:
+        return self.run(citation_id)
+
+    def run(self, citation_id: str) -> str:
+        """Explore citation relationships for a given citation ID.
+
+        Args:
+            citation_id: Law provision or court decision ID
+
+        Returns:
+            Formatted string with inbound and outbound citation info
+        """
+        if not citation_id or not citation_id.strip():
+            return "Error: Empty citation ID. Please provide a law or case citation."
+
+        citation_id = citation_id.strip()
+
+        try:
+            inbound = self.graph_retriever.get_top_inbound(citation_id, k=self.top_k)
+            outbound = self.graph_retriever.get_top_outbound(citation_id, k=self.top_k)
+        except Exception as exc:
+            logger.debug("Citation explorer failed for %s: %s", citation_id, exc)
+            return f"Error querying graph for '{citation_id}': {exc}"
+
+        sections = [f"=== Citation Explorer: {citation_id} ==="]
+
+        # Inbound: what cites this
+        sections.append(f"\n--- Cited BY (top {self.top_k}) ---")
+        if inbound:
+            for r in inbound:
+                sections.append(
+                    f"  {r['id']} [{r['type']}] (weight={r['weight']:.2f}, tf={r['tf']})"
+                )
+        else:
+            sections.append("  (no inbound citations found)")
+
+        # Outbound: what this cites
+        sections.append(f"\n--- CITES (top {self.top_k}) ---")
+        if outbound:
+            for r in outbound:
+                sections.append(
+                    f"  {r['id']} [{r['type']}] (weight={r['weight']:.2f}, tf={r['tf']})"
+                )
+        else:
+            sections.append("  (no outbound citations found)")
+
+        return "\n".join(sections)
+
+    def search_with_metadata(self, citation_id: str) -> dict:
+        """Return structured inbound/outbound citation data.
+
+        Args:
+            citation_id: Law provision or court decision ID
+
+        Returns:
+            Dict with ``"citation_id"``, ``"inbound"``, ``"outbound"`` keys
+        """
+        citation_id = (citation_id or "").strip()
+        try:
+            inbound = self.graph_retriever.get_top_inbound(citation_id, k=self.top_k)
+            outbound = self.graph_retriever.get_top_outbound(citation_id, k=self.top_k)
+        except Exception as exc:
+            logger.debug("Citation explorer failed for %s: %s", citation_id, exc)
+            inbound, outbound = [], []
+
+        return {
+            "citation_id": citation_id,
+            "inbound": inbound,
+            "outbound": outbound,
+        }
+
+
 def get_tool_descriptions() -> str:
     """Get formatted descriptions of all available tools.
 
@@ -301,6 +421,7 @@ def get_tool_descriptions() -> str:
     tools = [
         ("search_laws", LawSearchTool.description),
         ("search_courts", CourtSearchTool.description),
+        ("explore_citations", CitationExplorerTool.description),
     ]
 
     lines = []

@@ -184,6 +184,95 @@ class CitationGraphRetriever:
             )
             return [r["id"] for r in result]
 
+    def get_top_cases_citing_law(
+        self,
+        law_id: str,
+        k: int = 5,
+        include_text: bool = False,
+    ) -> list[dict]:
+        """Return cases that cite *law_id*, ranked by TF-IDF edge weight.
+
+        Returns:
+            List of ``{"case_id", "weight", "tf", "text"}`` dicts,
+            ordered by weight descending.
+        """
+        text_col = "c.text AS text," if include_text else "'' AS text,"
+        with self._driver.session() as s:
+            result = s.run(
+                f"""
+                MATCH (c:Case)-[r:CITES_LAW]->(l:Law {{id: $lid}})
+                RETURN c.id AS case_id,
+                       coalesce(r.weight, 0.0) AS weight,
+                       coalesce(r.tf, 0) AS tf,
+                       {text_col}
+                       c.volume AS volume,
+                       c.section AS section
+                ORDER BY r.weight DESC
+                LIMIT $k
+                """,
+                lid=law_id,
+                k=k,
+            )
+            return [dict(r) for r in result]
+
+    # ------------------------------------------------------------------
+    # Generic inbound / outbound citation lookup
+    # ------------------------------------------------------------------
+
+    def get_top_inbound(self, node_id: str, k: int = 10) -> list[dict]:
+        """Return the top-*k* entities that cite *node_id*, ranked by edge weight.
+
+        Works for both :Case and :Law nodes.  Each result dict carries
+        ``id``, ``type`` (``"Case"`` or ``"Law"``), ``rel_type``, ``weight``, ``tf``.
+        """
+        with self._driver.session() as s:
+            result = s.run(
+                """
+                OPTIONAL MATCH (c:Case {id: $nid})
+                OPTIONAL MATCH (l:Law {id: $nid})
+                WITH coalesce(c, l) AS target
+                WHERE target IS NOT NULL
+                MATCH (source)-[r]->(target)
+                RETURN source.id AS id,
+                       labels(source)[0] AS type,
+                       type(r) AS rel_type,
+                       coalesce(r.weight, 0.0) AS weight,
+                       coalesce(r.tf, 0) AS tf
+                ORDER BY weight DESC
+                LIMIT $k
+                """,
+                nid=node_id,
+                k=k,
+            )
+            return [dict(r) for r in result]
+
+    def get_top_outbound(self, node_id: str, k: int = 10) -> list[dict]:
+        """Return the top-*k* entities that *node_id* cites, ranked by edge weight.
+
+        Works for both :Case and :Law nodes.  Each result dict carries
+        ``id``, ``type`` (``"Case"`` or ``"Law"``), ``rel_type``, ``weight``, ``tf``.
+        """
+        with self._driver.session() as s:
+            result = s.run(
+                """
+                OPTIONAL MATCH (c:Case {id: $nid})
+                OPTIONAL MATCH (l:Law {id: $nid})
+                WITH coalesce(c, l) AS source
+                WHERE source IS NOT NULL
+                MATCH (source)-[r]->(target)
+                RETURN target.id AS id,
+                       labels(target)[0] AS type,
+                       type(r) AS rel_type,
+                       coalesce(r.weight, 0.0) AS weight,
+                       coalesce(r.tf, 0) AS tf
+                ORDER BY weight DESC
+                LIMIT $k
+                """,
+                nid=node_id,
+                k=k,
+            )
+            return [dict(r) for r in result]
+
     # ------------------------------------------------------------------
     # Co-citation analysis
     # ------------------------------------------------------------------

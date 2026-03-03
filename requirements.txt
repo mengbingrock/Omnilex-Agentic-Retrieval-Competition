@@ -1,11 +1,3 @@
-# Compatible pair: avoids "operator torchvision::nms does not exist" (torch/torchvision ABI mismatch)
-# Requires torch>=2.6 for transformers>=5.x (.bin loading blocked on <2.6 per CVE-2025-32434)
-# cu124 matches the system CUDA 12.4 runtime
-torch>=2.6.0,<2.7.0
-torchvision>=0.21.0,<0.22.0
-accelerate
-pandas
-sentence-transformers
 aiohappyeyeballs==2.6.1
 aiohttp==3.13.3
 aiosignal==1.4.0
@@ -89,10 +81,10 @@ nest-asyncio==1.6.0
 notebook==7.5.3
 notebook-shim==0.2.4
 numpy==2.4.2
+-e file:///Users/mengbing/WorkSync/Git/Omnilex-Agentic-Retrieval-Competition
 openai==2.21.0
 overrides==7.7.0
 packaging==26.0
-peft>=0.14.0
 pandas==3.0.0
 pandocfilters==1.5.1
 parso==0.8.6

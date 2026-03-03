@@ -36,6 +36,7 @@ from omnilex.graph import (
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 DEFAULT_CSV = DATA_DIR / "court_considerations.csv"
+DEFAULT_LAWS_CSV = DATA_DIR / "laws_de.csv"
 DEFAULT_EDGES_OUT = DATA_DIR / "processed" / "citation_edges.csv"
 
 
@@ -46,6 +47,17 @@ def main() -> None:
         type=Path,
         default=DEFAULT_CSV,
         help=f"Path to court_considerations.csv (default: {DEFAULT_CSV})",
+    )
+    parser.add_argument(
+        "--laws-csv",
+        type=Path,
+        default=DEFAULT_LAWS_CSV,
+        help=f"Path to laws_de.csv (default: {DEFAULT_LAWS_CSV})",
+    )
+    parser.add_argument(
+        "--no-laws",
+        action="store_true",
+        help="Skip loading laws_de.csv (only build case graph).",
     )
     parser.add_argument(
         "--max-rows",
@@ -80,10 +92,15 @@ def main() -> None:
         print(f"ERROR: CSV not found at {args.csv}")
         raise SystemExit(1)
 
+    laws_csv_path = None if args.no_laws else args.laws_csv
+    if laws_csv_path and not laws_csv_path.exists():
+        print(f"WARNING: laws CSV not found at {laws_csv_path}, skipping law loading.")
+        laws_csv_path = None
+
     # ---- Export-only mode ----
     if args.export_only:
         args.edges_out.parent.mkdir(parents=True, exist_ok=True)
-        export_edges_csv(args.csv, args.edges_out, max_rows=args.max_rows)
+        export_edges_csv(args.csv, args.edges_out, laws_csv_path=laws_csv_path, max_rows=args.max_rows)
         return
 
     # ---- Ensure Neo4j is running ----
@@ -99,8 +116,11 @@ def main() -> None:
 
     # ---- Build & load ----
     print(f"\n=== Building citation graph from {args.csv} ===")
+    if laws_csv_path:
+        print(f"    + law provisions from {laws_csv_path}")
     stats = build_and_load(
         args.csv,
+        laws_csv_path=laws_csv_path,
         max_rows=args.max_rows,
         clear_first=args.clear,
         verbose=True,

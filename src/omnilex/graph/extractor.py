@@ -175,6 +175,32 @@ def count_case_citations(text: str) -> dict[str, int]:
     return counts
 
 
+def count_art_citations(text: str) -> dict[str, int]:
+    """Count how many times each Art./§ citation appears in *text*.
+
+    Mirrors :func:`count_case_citations` but for law article references
+    so that TF-IDF weights can be computed for CITES_LAW edges.
+
+    Returns:
+        ``{canonical_id: count}``
+    """
+    if not text:
+        return {}
+
+    counts: dict[str, int] = {}
+    art_types = ("Art.", "§")
+
+    for regex, ctype in _COMPILED_PATTERNS:
+        if ctype not in art_types:
+            continue
+        for m in regex.finditer(text):
+            raw = re.sub(r"\s+", " ", m.group(0)).strip()
+            canonical = _canonicalize(raw, ctype)
+            counts[canonical] = counts.get(canonical, 0) + 1
+
+    return counts
+
+
 def parse_case_id_from_csv_citation(citation_field: str) -> str | None:
     """Extract the case-level BGE ID from a ``court_considerations.csv`` citation field.
 

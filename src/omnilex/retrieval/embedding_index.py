@@ -12,7 +12,6 @@ import os
 import pickle
 import time
 from pathlib import Path
-from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -67,8 +66,21 @@ def _get_huggingface_client() -> "InferenceClient":
     return InferenceClient(token=token)
 
 
+def _get_device() -> str:
+    """Return best available device: cuda > mps > cpu."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda"
+        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            return "mps"
+    except ImportError:
+        pass
+    return "cpu"
+
+
 def _get_local_transformer_client(model_name: str) -> Any:
-    """Load a local sentence-transformers model for embeddings."""
+    """Load a local sentence-transformers model for embeddings (GPU when available)."""
     try:
         from sentence_transformers import SentenceTransformer  # pyright: ignore[reportMissingImports]
     except Exception as exc:  # pragma: no cover
@@ -76,9 +88,8 @@ def _get_local_transformer_client(model_name: str) -> Any:
             "Local transformer backend requires sentence-transformers. "
             "Install it or set OMNILEX_EMBEDDING_BACKEND=auto."
         ) from exc
-    import torch
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    logger.info("Loading SentenceTransformer %s on device=%s", model_name, device)
+    device = _get_device()
+    logger.info("Using device %s for embedding model %s", device, model_name)
     return SentenceTransformer(model_name, device=device)
 
 
@@ -122,18 +133,17 @@ class EmbeddingIndex:
         self.citation_field = citation_field
         self.model = model or self.DEFAULT_MODEL
         self._backend = self._resolve_backend(self.model)
-        print(f"Embedding backend!!!!!!: {self._backend}")
-        # Only use passed-in client for OpenAI backend; HF backends use their own client.
+        # Only eagerly set the client when one is explicitly provided.
+        # All backends lazily create a client via the `client` property on
+        # first use (e.g. search or build), avoiding heavy model loads at
+        # import / load time.
         if self._backend == "openai" and openai_client is not None:
             self._client = openai_client
-        elif self._backend == "hf_inference":
-            self._client = _get_huggingface_client()
-        elif self._backend == "hf_local":
-            self._client = _get_local_transformer_client(self.model)
         else:
             self._client = None
         self.batch_size = batch_size
-        self.rate_limit_delay = rate_limit_delay
+        # No rate limit for local model (hf_local); only throttle API backends.
+        self.rate_limit_delay = 0.0 if self._backend == "hf_local" else rate_limit_delay
 
         self.documents: list[dict] = []
         self._embeddings: np.ndarray | None = None  # shape (n_docs, dim); used when faiss unavailable
@@ -354,8 +364,6 @@ class EmbeddingIndex:
 
     def _embed_batch_with_retry(self, batch: list[str]) -> list[list[float]]:
         """Call embedding API for a single batch, with retries."""
-        for i, text in enumerate(batch):
-            print(f"[DEBUG embed] batch item {i} ({len(text)} chars): {text!r}")
         delay = _RETRY_BASE_DELAY
         for attempt in range(1, _MAX_RETRIES + 1):
             try:
@@ -452,7 +460,6 @@ class EmbeddingIndex:
         show_progress: bool = True,
         progress_desc: str = "Building embedding index",
         chunk_overlap_tokens: int = 0,
-        preprocess_fn: Callable[[dict], dict] | None = None,
     ) -> None:
         """Build embedding index from documents.
 
@@ -465,8 +472,6 @@ class EmbeddingIndex:
             show_progress: Show a progress bar while embedding (default True)
             progress_desc: Label for the progress bar
             chunk_overlap_tokens: Token overlap between consecutive chunks
-            preprocess_fn: Optional callable applied to each document dict
-                before chunking/embedding (e.g. metadata enrichment).
         """
         self.documents = []
         n_docs = len(documents)
@@ -480,8 +485,6 @@ class EmbeddingIndex:
                 doc_iter = tqdm(doc_iter, total=n_docs, unit="doc", desc=progress_desc)
 
             for _di, doc in doc_iter:
-                if preprocess_fn is not None:
-                    doc = preprocess_fn(doc)
                 text = doc.get(self.text_field, "")
                 chunks = self._chunk_text(text, overlap_tokens=chunk_overlap_tokens)
                 n_chunks = len(chunks)
@@ -516,8 +519,6 @@ class EmbeddingIndex:
                 doc_iter = tqdm(doc_iter, total=n_docs, unit="doc", desc=progress_desc)
 
             for _di, doc in doc_iter:
-                if preprocess_fn is not None:
-                    doc = preprocess_fn(doc)
                 text = doc.get(self.text_field, "")
                 chunks = self._chunk_text(text, overlap_tokens=chunk_overlap_tokens)
                 n_chunks = len(chunks)

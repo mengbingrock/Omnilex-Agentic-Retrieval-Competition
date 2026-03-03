@@ -17,6 +17,19 @@ from typing import Sequence
 import numpy as np
 
 
+def _get_device() -> str:
+    """Return best available device: cuda > mps > cpu."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda"
+        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            return "mps"
+    except ImportError:
+        pass
+    return "cpu"
+
+
 class SemanticReranker:
     """Cross-encoder reranker for search result refinement.
 
@@ -50,9 +63,10 @@ class SemanticReranker:
 
         from sentence_transformers import CrossEncoder
 
+        resolved_device = device if device is not None else _get_device()
         self._model = CrossEncoder(
             self.model_name,
-            device=device,
+            device=resolved_device,
             max_length=self.max_length,
         )
 

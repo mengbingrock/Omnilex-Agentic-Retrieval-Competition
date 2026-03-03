@@ -23,6 +23,7 @@ from .docker_setup import (
 )
 from .extractor import (
     ExtractedCitation,
+    count_art_citations,
     count_case_citations,
     extract_all_case_citations,
     extract_bge_citations,
@@ -32,8 +33,10 @@ from .extractor import (
 from .loader import (
     build_and_load,
     build_case_edges,
+    build_law_citation_edges,
     export_edges_csv,
     parse_cases_from_csv,
+    parse_laws_from_csv,
 )
 from .retriever import CitationGraphRetriever, RetrievedCase
 from .schema import clear_all_data, create_schema, drop_schema, get_schema_info
@@ -52,6 +55,7 @@ __all__ = [
     "get_stats",
     # extractor
     "ExtractedCitation",
+    "count_art_citations",
     "count_case_citations",
     "extract_citations",
     "extract_bge_citations",
@@ -59,7 +63,9 @@ __all__ = [
     "parse_case_id_from_csv_citation",
     # loader
     "parse_cases_from_csv",
+    "parse_laws_from_csv",
     "build_case_edges",
+    "build_law_citation_edges",
     "build_and_load",
     "export_edges_csv",
     # retriever

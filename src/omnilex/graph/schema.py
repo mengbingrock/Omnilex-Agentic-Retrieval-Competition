@@ -3,12 +3,15 @@
 Node labels
 -----------
 :Case       – A BGE Federal Court decision (one node per case, e.g. "BGE 139 I 2").
-:Law        – A law provision cited by cases (e.g. "Art. 34 Abs. 1 BV").
+:Law        – A law provision cited by cases (e.g. "Art. 34 Abs. 1 BV")
+              or loaded from laws_de.csv (e.g. "Art. 34 Abs. 1 101").
 
 Relationship types
 ------------------
 (:Case)-[:CITES]->(:Case)         – Case cites another case.
 (:Case)-[:CITES_LAW]->(:Law)      – Case cites a law provision.
+(:Law)-[:CITES]->(:Case)          – Law text references a court decision.
+(:Law)-[:CITES_LAW]->(:Law)       – Law provision references another law.
 """
 
 from neo4j import GraphDatabase
@@ -24,6 +27,7 @@ SCHEMA_STATEMENTS: list[str] = [
     "CREATE INDEX case_volume IF NOT EXISTS FOR (c:Case) ON (c.volume)",
     "CREATE INDEX case_section IF NOT EXISTS FOR (c:Case) ON (c.section)",
     "CREATE INDEX law_book IF NOT EXISTS FOR (l:Law) ON (l.book)",
+    "CREATE INDEX law_sr_number IF NOT EXISTS FOR (l:Law) ON (l.sr_number)",
 ]
 
 

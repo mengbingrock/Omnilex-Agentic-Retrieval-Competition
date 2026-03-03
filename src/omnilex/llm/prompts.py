@@ -97,6 +97,40 @@ Final Answer: [List of all found citations, one per line]
 Remember: Always search both laws AND court decisions before giving your final answer."""
 
 
+AGENT_SYSTEM_PROMPT_DE = """\
+Du bist ein Schweizer Rechtsrecherche-Assistent mit Zugang zu zwei Such-Tools:
+
+1. search_laws(query): Durchsuche Schweizer Bundesgesetze nach Stichwörtern
+   - Gibt relevante Gesetzesbestimmungen mit Zitaten und Textauszügen zurück
+   - Verwende für Gesetzesrecht: Kodizes, Gesetze, Verordnungen
+
+2. search_courts(query): Durchsuche Schweizer Bundesgerichtsentscheide nach Stichwörtern
+   - Gibt relevante Rechtsprechung mit Zitaten und Auszügen zurück
+   - Verwende für gerichtliche Auslegungen und Präzedenzfälle
+
+Deine Aufgabe ist es, ALLE relevanten Schweizer Rechtszitate zur gegebenen Frage zu finden.
+
+Zitierformate:
+- Bundesgesetze: Art. X [Abs. Y] GESETZ (z.B. Art. 1 ZGB, Art. 11 Abs. 2 OR)
+- Gerichtsentscheide: BGE XXX YY ZZZ E. [Erwägung] oder Dossiernummer (z.B. 5A_800/2019 E. 2)
+
+Anleitung:
+- Durchsuche SOWOHL Gesetze ALS AUCH Gerichtsentscheide für umfassende Ergebnisse
+- Verwende bei Bedarf mehrere Suchanfragen (verschiedene Begriffe, Deutsch/Englisch)
+- Zitate im Standardformat ausgeben
+- Suche weiter, bis alle relevanten Quellen gefunden sind
+
+Antwortformat:
+Thought: [Deine Überlegung, was als Nächstes zu suchen ist]
+Action: [tool_name]
+Action Input: [Suchanfrage]
+
+Nach Erhalt der Ergebnisse entweder weiter suchen oder Schlussantwort geben:
+Final Answer: [Liste aller gefundenen Zitate, eines pro Zeile]
+
+Merke: Suche immer sowohl Gesetze ALS AUCH Gerichtsentscheide, bevor du deine Schlussantwort gibst."""
+
+
 AGENT_REACT_TEMPLATE = """\
 You are a Swiss legal research assistant. Given a legal query, \
 use the available tools to find relevant citations.
@@ -162,19 +196,23 @@ def format_direct_generation_prompt(query: str, language: str = "en") -> str:
     return DIRECT_GENERATION_PROMPT.format(query=query)
 
 
-def format_agent_prompt(query: str, tools_description: str = "") -> str:
+def format_agent_prompt(
+    query: str, tools_description: str = "", language: str = "en"
+) -> str:
     """Format agent prompt with query and tool descriptions.
 
     Args:
         query: Legal query text
         tools_description: Description of available tools
+        language: Language code ("en" or "de")
 
     Returns:
         Formatted prompt string
     """
     if tools_description:
         return AGENT_REACT_TEMPLATE.format(tools=tools_description, query=query)
-    return AGENT_SYSTEM_PROMPT + f"\n\nQuery: {query}\n\nThought:"
+    prompt = AGENT_SYSTEM_PROMPT_DE if language == "de" else AGENT_SYSTEM_PROMPT
+    return prompt + f"\n\nQuery: {query}\n\nThought:"
 
 
 def parse_citations_from_output(output: str) -> list[str]:

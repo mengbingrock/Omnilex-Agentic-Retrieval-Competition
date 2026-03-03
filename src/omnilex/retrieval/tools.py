@@ -4,7 +4,24 @@ These tools are designed to be used with ReAct-style agents or
 LangChain-compatible tool interfaces.
 """
 
+from typing import Protocol, runtime_checkable
+
 from .bm25_index import BM25Index
+
+
+@runtime_checkable
+class SearchIndex(Protocol):
+    """Protocol for search backends (BM25Index, EmbeddingIndex, etc.)."""
+
+    documents: list
+
+    def search(
+        self,
+        query: str,
+        top_k: int = 10,
+        return_scores: bool = False,
+    ) -> list[dict]: ...
+    def save(self, path) -> None: ...
 
 
 class LawSearchTool:
@@ -25,14 +42,14 @@ Example queries: "contract formation requirements", "Vertragsabschluss", "divorc
 
     def __init__(
         self,
-        index: BM25Index,
+        index: SearchIndex | BM25Index,
         top_k: int = 5,
         max_excerpt_length: int = 300,
     ):
         """Initialize law search tool.
 
         Args:
-            index: BM25Index for federal laws corpus
+            index: Search index for federal laws (BM25Index or EmbeddingIndex)
             top_k: Number of results to return
             max_excerpt_length: Maximum characters for text excerpts
         """
@@ -122,14 +139,14 @@ Example queries: "negligence standard of care", "Sorgfaltspflicht", "contract in
 
     def __init__(
         self,
-        index: BM25Index,
+        index: SearchIndex | BM25Index,
         top_k: int = 5,
         max_excerpt_length: int = 300,
     ):
         """Initialize court search tool.
 
         Args:
-            index: BM25Index for court decisions corpus
+            index: Search index for court decisions (BM25Index or EmbeddingIndex)
             top_k: Number of results to return
             max_excerpt_length: Maximum characters for text excerpts
         """
@@ -217,16 +234,16 @@ Use this for comprehensive research when you need both statutory law and case la
 
     def __init__(
         self,
-        law_index: BM25Index,
-        court_index: BM25Index,
+        law_index: SearchIndex | BM25Index,
+        court_index: SearchIndex | BM25Index,
         top_k_each: int = 3,
         max_excerpt_length: int = 250,
     ):
         """Initialize combined search tool.
 
         Args:
-            law_index: BM25Index for federal laws
-            court_index: BM25Index for court decisions
+            law_index: Search index for federal laws (BM25Index or EmbeddingIndex)
+            court_index: Search index for court decisions (BM25Index or EmbeddingIndex)
             top_k_each: Number of results from each corpus
             max_excerpt_length: Maximum characters for excerpts
         """

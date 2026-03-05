@@ -430,14 +430,12 @@ Example queries: "negligence standard of care", "Sorgfaltspflicht", "contract in
 # Create tools
 law_tool = LawSearchTool(
     index=laws_index,
-    top_k=CONFIG["top_k_laws"],
-    max_excerpt_length=300,
+    threshold=CONFIG.get("threshold_laws", 0.3),
 )
 
 court_tool = CourtSearchTool(
     index=courts_index,
-    top_k=CONFIG["top_k_courts"],
-    max_excerpt_length=300,
+    threshold=CONFIG.get("threshold_courts", 0.3),
 )
 
 # Tool registry

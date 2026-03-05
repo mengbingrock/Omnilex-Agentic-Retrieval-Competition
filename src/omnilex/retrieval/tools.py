@@ -7,6 +7,7 @@ LangChain-compatible tool interfaces.
 from __future__ import annotations
 
 import logging
+import re
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from .bm25_index import BM25Index
@@ -15,6 +16,24 @@ if TYPE_CHECKING:
     from omnilex.graph.retriever import CitationGraphRetriever
 
 logger = logging.getLogger(__name__)
+
+# Regex: citation-like query ending with a law abbreviation (e.g. "Art. 6a Abs. 3 BankG")
+_CITATION_TAIL_RE = re.compile(r"^(.+\S)\s+([A-Z][A-Za-z0-9äöüÄÖÜ]*)$")
+
+
+def _loosen_query(query: str) -> str | None:
+    """Strip the trailing law abbreviation from a citation-style query.
+
+    "Art. 6a Abs. 3 BankG" -> "Art. 6a Abs. 3"
+
+    Returns None if the query cannot be loosened.
+    """
+    m = _CITATION_TAIL_RE.match(query.strip())
+    if m:
+        loosened = m.group(1).strip()
+        if loosened:
+            return loosened
+    return None
 
 
 @runtime_checkable
@@ -51,22 +70,29 @@ Example queries: "contract formation requirements", "Vertragsabschluss", "divorc
     def __init__(
         self,
         index: SearchIndex | BM25Index,
-        index: SearchIndex | BM25Index,
-        top_k: int = 5,
-        max_excerpt_length: int = 300,
+        threshold: float = 0.3,
+        candidate_k: int = 50,
+        max_results: int = 10,
     ):
         """Initialize law search tool.
 
         Args:
             index: Search index for federal laws (BM25Index or EmbeddingIndex)
-            index: Search index for federal laws (BM25Index or EmbeddingIndex)
-            top_k: Number of results to return
-            max_excerpt_length: Maximum characters for text excerpts
+            threshold: Minimum similarity score to include a result
+            candidate_k: Number of candidates to fetch before filtering by threshold
+            max_results: Maximum number of results to return per query
         """
         self.index = index
-        self.top_k = top_k
-        self.max_excerpt_length = max_excerpt_length
+        self.threshold = threshold
+        self.candidate_k = candidate_k
+        self.max_results = max_results
         self._last_results: list[dict] = []
+
+    def _search_by_threshold(self, query: str) -> list[dict]:
+        """Fetch candidates, filter by score threshold, cap to max_results."""
+        results = self.index.search(query, top_k=self.candidate_k, return_scores=True)
+        results = [doc for doc in results if doc.get("_score", 0) >= self.threshold]
+        return results[:self.max_results]
 
     def __call__(self, query: str) -> str:
         """Execute search and return formatted results.
@@ -92,7 +118,15 @@ Example queries: "contract formation requirements", "Vertragsabschluss", "divorc
             self._last_results = []
             return "Error: Empty query. Please provide search terms."
 
-        results = self.index.search(query, top_k=self.top_k)
+        results = self._search_by_threshold(query)
+
+        # Fallback: loosen the query by stripping trailing law abbreviation
+        if not results:
+            loosened = _loosen_query(query)
+            if loosened:
+                logger.debug("No results for '%s', retrying with loosened query '%s'", query, loosened)
+                results = self._search_by_threshold(loosened)
+
         self._last_results = results
 
         if not results:
@@ -102,14 +136,11 @@ Example queries: "contract formation requirements", "Vertragsabschluss", "divorc
         for doc in results:
             citation = doc.get("citation", "Unknown")
             text = doc.get("text", "")
+            score = doc.get("_score", 0)
 
-            # Truncate text for readability
-            if len(text) > self.max_excerpt_length:
-                text = text[: self.max_excerpt_length] + "..."
+            formatted.append(f"[{score:.3f}] {citation}\n{text}")
 
-            formatted.append(f"- {citation}: {text}")
-
-        return "\n".join(formatted)
+        return "\n\n".join(formatted)
 
     def get_last_citations(self) -> list[str]:
         """Return citations from the last search.
@@ -126,9 +157,14 @@ Example queries: "contract formation requirements", "Vertragsabschluss", "divorc
             query: Search query string
 
         Returns:
-            List of result dictionaries with full metadata
+            List of result dictionaries with full metadata (filtered by threshold, capped to max_results)
         """
-        return self.index.search(query, top_k=self.top_k, return_scores=True)
+        results = self._search_by_threshold(query)
+        if not results:
+            loosened = _loosen_query(query)
+            if loosened:
+                results = self._search_by_threshold(loosened)
+        return results
 
 
 class CourtSearchTool:
@@ -150,22 +186,29 @@ Example queries: "negligence standard of care", "Sorgfaltspflicht", "contract in
     def __init__(
         self,
         index: SearchIndex | BM25Index,
-        index: SearchIndex | BM25Index,
-        top_k: int = 5,
-        max_excerpt_length: int = 300,
+        threshold: float = 0.3,
+        candidate_k: int = 50,
+        max_results: int = 10,
     ):
         """Initialize court search tool.
 
         Args:
             index: Search index for court decisions (BM25Index or EmbeddingIndex)
-            index: Search index for court decisions (BM25Index or EmbeddingIndex)
-            top_k: Number of results to return
-            max_excerpt_length: Maximum characters for text excerpts
+            threshold: Minimum similarity score to include a result
+            candidate_k: Number of candidates to fetch before filtering by threshold
+            max_results: Maximum number of results to return per query
         """
         self.index = index
-        self.top_k = top_k
-        self.max_excerpt_length = max_excerpt_length
+        self.threshold = threshold
+        self.candidate_k = candidate_k
+        self.max_results = max_results
         self._last_results: list[dict] = []
+
+    def _search_by_threshold(self, query: str) -> list[dict]:
+        """Fetch candidates, filter by score threshold, cap to max_results."""
+        results = self.index.search(query, top_k=self.candidate_k, return_scores=True)
+        results = [doc for doc in results if doc.get("_score", 0) >= self.threshold]
+        return results[:self.max_results]
 
     def __call__(self, query: str) -> str:
         """Execute search and return formatted results.
@@ -191,7 +234,15 @@ Example queries: "negligence standard of care", "Sorgfaltspflicht", "contract in
             self._last_results = []
             return "Error: Empty query. Please provide search terms."
 
-        results = self.index.search(query, top_k=self.top_k)
+        results = self._search_by_threshold(query)
+
+        # Fallback: loosen the query by stripping trailing law abbreviation
+        if not results:
+            loosened = _loosen_query(query)
+            if loosened:
+                logger.debug("No results for '%s', retrying with loosened query '%s'", query, loosened)
+                results = self._search_by_threshold(loosened)
+
         self._last_results = results
 
         if not results:
@@ -201,14 +252,11 @@ Example queries: "negligence standard of care", "Sorgfaltspflicht", "contract in
         for doc in results:
             citation = doc.get("citation", "Unknown")
             text = doc.get("text", "")
+            score = doc.get("_score", 0)
 
-            # Truncate text for readability
-            if len(text) > self.max_excerpt_length:
-                text = text[: self.max_excerpt_length] + "..."
+            formatted.append(f"[{score:.3f}] {citation}\n{text}")
 
-            formatted.append(f"- {citation}: {text}")
-
-        return "\n".join(formatted)
+        return "\n\n".join(formatted)
 
     def get_last_citations(self) -> list[str]:
         """Return citations from the last search.
@@ -225,9 +273,14 @@ Example queries: "negligence standard of care", "Sorgfaltspflicht", "contract in
             query: Search query string
 
         Returns:
-            List of result dictionaries with full metadata
+            List of result dictionaries with full metadata (filtered by threshold, capped to max_results)
         """
-        return self.index.search(query, top_k=self.top_k, return_scores=True)
+        results = self._search_by_threshold(query)
+        if not results:
+            loosened = _loosen_query(query)
+            if loosened:
+                results = self._search_by_threshold(loosened)
+        return results
 
 
 class CombinedSearchTool:
@@ -248,30 +301,22 @@ Use this for comprehensive research when you need both statutory law and case la
         self,
         law_index: SearchIndex | BM25Index,
         court_index: SearchIndex | BM25Index,
-        law_index: SearchIndex | BM25Index,
-        court_index: SearchIndex | BM25Index,
-        top_k_each: int = 3,
-        max_excerpt_length: int = 250,
+        threshold: float = 0.3,
     ):
         """Initialize combined search tool.
 
         Args:
             law_index: Search index for federal laws (BM25Index or EmbeddingIndex)
             court_index: Search index for court decisions (BM25Index or EmbeddingIndex)
-            law_index: Search index for federal laws (BM25Index or EmbeddingIndex)
-            court_index: Search index for court decisions (BM25Index or EmbeddingIndex)
-            top_k_each: Number of results from each corpus
-            max_excerpt_length: Maximum characters for excerpts
+            threshold: Minimum similarity score to include a result
         """
         self.law_tool = LawSearchTool(
             law_index,
-            top_k=top_k_each,
-            max_excerpt_length=max_excerpt_length,
+            threshold=threshold,
         )
         self.court_tool = CourtSearchTool(
             court_index,
-            top_k=top_k_each,
-            max_excerpt_length=max_excerpt_length,
+            threshold=threshold,
         )
 
     def __call__(self, query: str) -> str:
@@ -370,8 +415,9 @@ Example inputs: "Art. 41 Abs. 1 OR", "BGE 145 II 32", "Art. 1 ZGB"
         sections.append(f"\n--- Cited BY (top {self.top_k}) ---")
         if inbound:
             for r in inbound:
+                text = r.get("text", "")
                 sections.append(
-                    f"  {r['id']} [{r['type']}] (weight={r['weight']:.2f}, tf={r['tf']})"
+                    f"[{r['weight']:.2f}] {r['id']} [{r['type']}]\n{text}"
                 )
         else:
             sections.append("  (no inbound citations found)")
@@ -380,13 +426,14 @@ Example inputs: "Art. 41 Abs. 1 OR", "BGE 145 II 32", "Art. 1 ZGB"
         sections.append(f"\n--- CITES (top {self.top_k}) ---")
         if outbound:
             for r in outbound:
+                text = r.get("text", "")
                 sections.append(
-                    f"  {r['id']} [{r['type']}] (weight={r['weight']:.2f}, tf={r['tf']})"
+                    f"[{r['weight']:.2f}] {r['id']} [{r['type']}]\n{text}"
                 )
         else:
             sections.append("  (no outbound citations found)")
 
-        return "\n".join(sections)
+        return "\n\n".join(sections)
 
     def search_with_metadata(self, citation_id: str) -> dict:
         """Return structured inbound/outbound citation data.

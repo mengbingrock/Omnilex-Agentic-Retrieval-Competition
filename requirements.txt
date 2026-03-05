@@ -81,7 +81,6 @@ nest-asyncio==1.6.0
 notebook==7.5.3
 notebook-shim==0.2.4
 numpy==2.4.2
--e file:///Users/mengbing/WorkSync/Git/Omnilex-Agentic-Retrieval-Competition
 openai==2.21.0
 overrides==7.7.0
 packaging==26.0

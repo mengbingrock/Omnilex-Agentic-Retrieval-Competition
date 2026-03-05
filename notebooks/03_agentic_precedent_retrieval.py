@@ -391,22 +391,20 @@ def main():
         print("Saving index to cache...")
         courts_index.save(COURTS_INDEX_CACHE)
         print(f"Courts index built and cached to {COURTS_INDEX_CACHE}")
-    # Create search tools with appropriate top_k values
+    # Create search tools with threshold-based filtering
     law_tool = LawSearchTool(
         index=laws_index,
-        top_k=CONFIG["top_k_laws"],
-        max_excerpt_length=300
+        threshold=CONFIG.get("threshold_laws", 0.3),
     )
 
     court_tool = CourtSearchTool(
         index=courts_index,
-        top_k=CONFIG["top_k_courts"],
-        max_excerpt_length=300
+        threshold=CONFIG.get("threshold_courts", 0.3),
     )
 
     print("Search tools initialized:")
-    print(f"  - Law search tool (top_k={CONFIG['top_k_laws']})")
-    print(f"  - Court search tool (top_k={CONFIG['top_k_courts']})")
+    print(f"  - Law search tool (threshold={CONFIG.get('threshold_laws', 0.3)})")
+    print(f"  - Court search tool (threshold={CONFIG.get('threshold_courts', 0.3)})")
     # Test tools
     print("Testing law search:")
     print(law_tool("Vertrag Abschluss")[:500])

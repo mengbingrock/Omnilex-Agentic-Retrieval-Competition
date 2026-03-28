@@ -76,7 +76,7 @@ from openai import OpenAI
 # Uses OPENAI_API_KEY from environment (or .env). Set it before running.
 # Uses OPENAI_API_KEY from environment. Set it before running:
 #   export OPENAI_API_KEY=sk-...
-client = OpenAI(api_key="")
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 print(f"OpenAI client ready. Model: {CONFIG['model']}")
 
 # === 3. Define Generation Prompt ===
@@ -272,7 +272,24 @@ print(f"\nGenerated predictions for {len(predictions)} queries")
 predictions_df = pd.DataFrame(predictions)
 print(predictions_df.head(10))
 
-# === 6. Create Submission ===
+# === 6. Evaluate on Validation Set ===
+
+if IS_VALIDATION_MODE and "gold_citations" in test_df.columns:
+    from omnilex.evaluation.scorer import evaluate_submission
+
+    gold_df = test_df[["query_id", "gold_citations"]].copy()
+    scores = evaluate_submission(predictions_df, gold_df)
+
+    print("\n=== Validation Scores ===")
+    print(f"  Macro F1:        {scores['macro_f1']:.4f}")
+    print(f"  Macro Precision: {scores['macro_precision']:.4f}")
+    print(f"  Macro Recall:    {scores['macro_recall']:.4f}")
+    print(f"  Micro F1:        {scores['micro_f1']:.4f}")
+    print(f"  MAP:             {scores['map']:.4f}")
+else:
+    print("\nSkipping evaluation (not in validation mode or no gold citations available)")
+
+# === 7. Create Submission ===
 
 # Save submission
 submission_path = OUTPUT_PATH / "submission.csv"

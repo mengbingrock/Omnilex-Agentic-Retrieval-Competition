@@ -51,14 +51,12 @@ Example queries: "contract formation requirements", "Vertragsabschluss", "divorc
     def __init__(
         self,
         index: SearchIndex | BM25Index,
-        index: SearchIndex | BM25Index,
         top_k: int = 5,
         max_excerpt_length: int = 300,
     ):
         """Initialize law search tool.
 
         Args:
-            index: Search index for federal laws (BM25Index or EmbeddingIndex)
             index: Search index for federal laws (BM25Index or EmbeddingIndex)
             top_k: Number of results to return
             max_excerpt_length: Maximum characters for text excerpts
@@ -150,14 +148,12 @@ Example queries: "negligence standard of care", "Sorgfaltspflicht", "contract in
     def __init__(
         self,
         index: SearchIndex | BM25Index,
-        index: SearchIndex | BM25Index,
         top_k: int = 5,
         max_excerpt_length: int = 300,
     ):
         """Initialize court search tool.
 
         Args:
-            index: Search index for court decisions (BM25Index or EmbeddingIndex)
             index: Search index for court decisions (BM25Index or EmbeddingIndex)
             top_k: Number of results to return
             max_excerpt_length: Maximum characters for text excerpts
@@ -248,16 +244,12 @@ Use this for comprehensive research when you need both statutory law and case la
         self,
         law_index: SearchIndex | BM25Index,
         court_index: SearchIndex | BM25Index,
-        law_index: SearchIndex | BM25Index,
-        court_index: SearchIndex | BM25Index,
         top_k_each: int = 3,
         max_excerpt_length: int = 250,
     ):
         """Initialize combined search tool.
 
         Args:
-            law_index: Search index for federal laws (BM25Index or EmbeddingIndex)
-            court_index: Search index for court decisions (BM25Index or EmbeddingIndex)
             law_index: Search index for federal laws (BM25Index or EmbeddingIndex)
             court_index: Search index for court decisions (BM25Index or EmbeddingIndex)
             top_k_each: Number of results from each corpus

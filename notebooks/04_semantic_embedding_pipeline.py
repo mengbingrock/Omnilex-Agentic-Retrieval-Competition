@@ -36,12 +36,12 @@ import pandas as pd
 from pathlib import Path
 from tqdm import tqdm
 from openai import OpenAI
-import tiktoken
 
 from omnilex.config import OPENAI_API_KEY, EMBEDDING_MODEL, get_semantic_embedding_config
 from omnilex.retrieval.bm25_index import BM25Index
 from omnilex.retrieval.embedding_index import EmbeddingIndex
-from omnilex.retrieval.tools import LawSearchTool, CourtSearchTool, SearchIndex
+from omnilex.retrieval.tools import LawSearchTool, CourtSearchTool, SearchIndex, CitationExplorerTool
+from omnilex.graph.retriever import CitationGraphRetriever
 from omnilex.citations.normalizer import CitationNormalizer
 from omnilex.evaluation.scorer import evaluate_submission
 
@@ -353,16 +353,21 @@ def _generate_summary(text: str, llm_client, model: str, temperature: float = 0.
     truncated = text[:3000]
     prompt = SUMMARY_PROMPT.replace("{text}", truncated)
     try:
+        msgs = [
+            {"role": "system", "content": "Du bist ein hilfreicher Schweizer Rechtsassistent."},
+            {"role": "user", "content": prompt},
+        ]
+        print(f"[LLM CALL] _generate_summary | model={model} | input_len={len(prompt)}")
         response = llm_client.chat.completions.create(
             model=model,
-            messages=[
-                {"role": "system", "content": "Du bist ein hilfreicher Schweizer Rechtsassistent."},
-                {"role": "user", "content": prompt},
-            ],
+            messages=msgs,
             temperature=temperature,
         )
-        return (response.choices[0].message.content or "").strip()
+        result = (response.choices[0].message.content or "").strip()
+        print(f"[LLM RESP] _generate_summary | output_len={len(result)} | preview={result[:120]!r}")
+        return result
     except Exception as exc:
+        print(f"[LLM ERR]  _generate_summary | {exc}")
         logger_meta.warning("Summary generation failed: %s", exc)
         return ""
 
@@ -412,6 +417,13 @@ def enrich_documents_with_metadata(
         citation = str(doc.get(citation_field, "")).strip()
         text = str(doc.get(text_field, "")).strip()
 
+        # If the citation was manually concatenated at the start, strip it
+        # so it only appears in the metadata block.
+        if citation and text.startswith(citation):
+            after = text[len(citation):]
+            if after and after[0] in (":", "-", "\n", " "):
+                text = after.lstrip(":- \n").strip()
+
         # Look up or generate summary
         summary = ""
         if add_summary:
@@ -425,7 +437,7 @@ def enrich_documents_with_metadata(
                 if rate_limit_delay > 0:
                     time.sleep(rate_limit_delay)
 
-        # Build enriched text: <metadata> block + original text
+        # Build enriched text: citation ONLY in <metadata> block
         metadata_lines: list[str] = []
         if citation:
             metadata_lines.append(f"Zitat: {citation}")
@@ -451,6 +463,44 @@ def enrich_documents_with_metadata(
 
     print(f"Metadata enrichment complete: {len(enriched)} documents enriched, {new_summaries} new summaries generated")
     return enriched
+
+
+# ---------------------------------------------------------------------------
+# Deduplication helper
+# ---------------------------------------------------------------------------
+
+def deduplicate_laws(
+    documents: list[dict],
+    text_field: str = "text",
+    citation_field: str = "citation",
+) -> list[dict]:
+    """Deduplicate documents with identical text, merging their citations.
+
+    When multiple law articles share the exact same text content, they are
+    collapsed into a single document.  The citation field becomes a
+    semicolon-separated list of all original citations so the metadata
+    captures every reference.
+
+    Returns a new list (originals are not mutated).
+    """
+    from collections import OrderedDict
+
+    grouped: OrderedDict[str, dict] = OrderedDict()
+    for doc in documents:
+        text = str(doc.get(text_field, "")).strip()
+        if text in grouped:
+            existing_citation = str(grouped[text].get(citation_field, ""))
+            new_citation = str(doc.get(citation_field, "")).strip()
+            if new_citation and new_citation not in existing_citation:
+                grouped[text][citation_field] = existing_citation + "; " + new_citation
+        else:
+            grouped[text] = {**doc}
+
+    deduped = list(grouped.values())
+    n_removed = len(documents) - len(deduped)
+    if n_removed > 0:
+        print(f"Deduplication: {len(documents)} → {len(deduped)} documents ({n_removed} duplicates merged)")
+    return deduped
 
 
 # ---------------------------------------------------------------------------
@@ -503,6 +553,15 @@ def _make_single_doc_enricher(
         citation = str(doc.get(citation_field, "")).strip()
         text = str(doc.get(text_field, "")).strip()
 
+        # If the citation was manually concatenated at the start (e.g. "Art. 22 ...: <content>"),
+        # strip it so it only appears in the metadata block.
+        # If the citation appears naturally within the text body, keep it.
+        if citation and text.startswith(citation):
+            after = text[len(citation):]
+            # Only strip if followed by separator (colon, dash, newline) — indicates concatenation
+            if after and after[0] in (":", "-", "\n", " "):
+                text = after.lstrip(":- \n").strip()
+
         # Look up or generate summary
         summary = ""
         if add_summary:
@@ -515,7 +574,7 @@ def _make_single_doc_enricher(
                 if rate_limit_delay > 0:
                     time.sleep(rate_limit_delay)
 
-        # Build enriched text: <metadata> block + original text
+        # Build enriched text: citation ONLY in <metadata> block, not in text body
         metadata_lines: list[str] = []
         if citation:
             metadata_lines.append(f"Zitat: {citation}")
@@ -571,199 +630,388 @@ print("Testing citation extraction:")
 extracted = extract_citations_from_text(test_text)
 print(f"Found {len(extracted)} citations: {sorted(extracted)}")
 
-# Model context window sizes (tokens)
-_MODEL_CONTEXT_WINDOW: dict[str, int] = {
-    "gpt-4o": 128_000,
-    "gpt-4o-mini": 128_000,
-    "gpt-4-turbo": 128_000,
-    "gpt-4": 8_192,
-    "gpt-3.5-turbo": 16_385,
-}
+# ======================================================================
+# TOOL DEFINITIONS (standard OpenAI tool-calling format)
+# ======================================================================
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_laws",
+            "description": (
+                "Durchsuche Schweizer Bundesgesetze (SR/Systematische Rechtssammlung). "
+                "Gibt relevante Gesetzesbestimmungen mit Zitaten und Textauszügen zurück. "
+                "Verwende für Gesetzesrecht: Kodizes, Gesetze, Verordnungen. "
+                "Suche IMMER auf Deutsch."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Deutsche Suchanfrage für Gesetzesartikel",
+                    }
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_courts",
+            "description": (
+                "Durchsuche Schweizer Bundesgerichtsentscheide (BGE). "
+                "Gibt relevante Rechtsprechung mit Zitaten und Auszügen zurück. "
+                "Verwende für Gerichtsentscheide und Präzedenzfälle. "
+                "Suche IMMER auf Deutsch."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Deutsche Suchanfrage für Gerichtsentscheide",
+                    }
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "explore_citations",
+            "description": (
+                "Erkunde das Zitationsnetzwerk eines bestimmten Gesetzes oder Entscheids. "
+                "Ausgabe: Zwei Listen – was diese Entität am meisten zitiert und was sie am meisten zitiert wird. "
+                "Verwende dieses Tool, um das Zitationsnetzwerk rund um ein bekanntes Gesetz oder einen Entscheid zu verstehen. "
+                "Beispiel-Eingaben: 'Art. 41 Abs. 1 OR', 'BGE 145 II 32', 'Art. 1 ZGB'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "citation_id": {
+                        "type": "string",
+                        "description": "Zitations-ID (z.B. 'Art. 34 BV', 'BGE 139 I 2')",
+                    }
+                },
+                "required": ["citation_id"],
+            },
+        },
+    },
+]
 
 
-def warn_if_conversation_exceeds_context(conversation: str, model: str) -> None:
-    """Print a warning if the conversation exceeds the model's context window."""
-    max_tokens = _MODEL_CONTEXT_WINDOW.get(model, 128_000)
-    try:
-        enc = tiktoken.encoding_for_model(model)
-    except KeyError:
-        enc = tiktoken.get_encoding("cl100k_base")
-    n_tokens = len(enc.encode(conversation))
-    if n_tokens > max_tokens:
-        warnings.warn(
-            f"Conversation length ({n_tokens:,} tokens) exceeds {model} "
-            f"context window ({max_tokens:,} tokens). "
-            f"Response quality may degrade.",
-            stacklevel=2,
-        )
+def _is_citation_relevant(query: str, citation: str, text: str) -> bool:
+    """Check whether a single citation is relevant to the query.
 
+    Args:
+        query: The original legal query.
+        citation: The citation identifier (e.g. "Art. 221 StPO").
+        text: The full text / excerpt associated with this citation.
 
-def _llm_completion(conversation: str) -> str:
-    """Call OpenAI API and return assistant text. Applies rate limit delay."""
-    r = client.chat.completions.create(
-        model=CONFIG["model"],
-        messages=[
-            {"role": "system", "content": ENHANCED_AGENT_PROMPT},
-            {"role": "user", "content": conversation},
-        ],
-        temperature=CONFIG["temperature"],
-        stop=["Observation:", "[INST]", "</s>"],
+    Returns:
+        True if the citation is relevant, False otherwise.
+    """
+    prompt = (
+        f"Anfrage: {query}\n\n"
+        f"Zitat: {citation}\n"
+        f"Text:\n{text}\n\n"
+        "Ist dieses Zitat thematisch relevant für die Anfrage? "
+        "Antworte NUR mit JA oder NEIN."
     )
-    text = (r.choices[0].message.content or "").strip()
-    delay = CONFIG.get("rate_limit_delay", 0)
-    if delay > 0:
-        time.sleep(delay)
-    return text
+
+    try:
+        print(f"[LLM CALL] _is_citation_relevant | model={CONFIG['model']} | citation={citation!r}")
+        r = client.chat.completions.create(
+            model=CONFIG["model"],
+            messages=[
+                {"role": "system", "content": "Du bist ein Relevanz-Filter für Schweizer Rechtsrecherche. Antworte ausschliesslich mit JA oder NEIN."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.0,
+        )
+        answer = (r.choices[0].message.content or "").strip().upper()
+        result = answer.startswith("JA")
+        print(f"[LLM RESP] _is_citation_relevant | citation={citation!r} | answer={answer!r} | relevant={result}")
+        delay = CONFIG.get("rate_limit_delay", 0)
+        if delay > 0:
+            time.sleep(delay)
+        return result
+    except Exception as e:
+        print(f"[LLM ERR]  _is_citation_relevant | citation={citation!r} | {e}")
+        warnings.warn(f"Relevance check failed for {citation} ({e}), keeping it.", stacklevel=2)
+        return True  # keep on error
+
+
+def _filter_relevant_citations(
+    query: str,
+    citation_text_pairs: list[tuple[str, str]],
+) -> tuple[list[str], list[str]]:
+    """Verify each citation individually against the query.
+
+    Args:
+        query: The original legal query.
+        citation_text_pairs: List of (citation_id, associated_text) tuples.
+
+    Returns:
+        Tuple of (verified_citations, discarded_citations).
+    """
+    verified: list[str] = []
+    discarded: list[str] = []
+    seen: set[str] = set()
+    for citation, text in citation_text_pairs:
+        if citation in seen:
+            continue
+        seen.add(citation)
+        if _is_citation_relevant(query, citation, text):
+            verified.append(citation)
+        else:
+            discarded.append(citation)
+    return verified, discarded
 
 
 def run_agent_with_precedent_analysis(
     query: str,
     law_tool: LawSearchTool,
     court_tool: CourtSearchTool,
+    citation_explorer: CitationExplorerTool | None = None,
     verbose: bool = False,
 ) -> tuple[list[str], list[dict]]:
     """
-    Run ReAct agent with three-stage citation discovery:
+    Run agent with standard OpenAI tool-calling for three-stage citation discovery:
     1. Initial retrieval (BM25 / embedding) → broad candidate set
-    2. Semantic embedding → refined top results
-    3. Court search + citation extraction from court texts
+    2. Court search + citation extraction from court texts
+    3. Citation graph exploration via explore_citations
 
     Args:
         query: Legal query to research
         law_tool: LawSearchTool instance
         court_tool: CourtSearchTool instance
+        citation_explorer: CitationExplorerTool instance for graph-based citation exploration
         verbose: Whether to print per-iteration details
 
     Returns:
         Tuple of (citations, logs) where logs contains detailed execution information
     """
-    conversation = f"[INST] {ENHANCED_AGENT_PROMPT}\n\nQuery: {query}\n\nThought: [/INST]"
-    all_citations = set()
+    all_citations: set[str] = set()
     logs: list[dict] = []
 
-    for iteration in range(CONFIG["max_iterations"]):
-        # Warn if conversation exceeds model context window
-        warn_if_conversation_exceeds_context(conversation, CONFIG["model"])
+    messages = [
+        {"role": "system", "content": ENHANCED_AGENT_PROMPT},
+        {"role": "user", "content": query},
+    ]
 
-        # Get LLM response
+    # Select available tools (exclude explore_citations if no graph DB)
+    active_tools = TOOLS if citation_explorer else [
+        t for t in TOOLS if t["function"]["name"] != "explore_citations"
+    ]
+
+    for iteration in range(CONFIG["max_iterations"]):
+        # Get LLM response with tool definitions
         try:
-            response = _llm_completion(conversation)
+            print(f"[LLM CALL] iteration={iteration+1} | model={CONFIG['model']}")
+            response = client.chat.completions.create(
+                model=CONFIG["model"],
+                messages=messages,
+                tools=active_tools,
+                temperature=CONFIG["temperature"],
+            )
+            message = response.choices[0].message
+            messages.append(message)
         except Exception as e:
             print(f"Error in LLM call: {e}")
             logs.append({
                 "iteration": iteration + 1,
                 "action": "LLM Error",
                 "error": str(e),
-                "conversation_snapshot": conversation,
             })
             break
 
         if verbose:
             print(f"\n--- Iteration {iteration + 1} ---")
-            print(response[:500] + "..." if len(response) > 500 else response)
+            if message.content:
+                content_preview = message.content[:500]
+                print(content_preview + ("..." if len(message.content) > 500 else ""))
+            if message.tool_calls:
+                for tc in message.tool_calls:
+                    print(f"  [Tool Call] {tc.function.name}({tc.function.arguments})")
 
-        # Parse action from response
-        action_match = re.search(r'Action:\s*([\w_]+)', response)
-        input_match = re.search(r'Action Input:\s*(.+?)(?=\n|$)', response, re.IGNORECASE)
+        # No tool calls → final answer (LLM decided to respond directly)
+        if not message.tool_calls:
+            final_text = message.content or ""
+            print(f"[LLM RESP] Final answer | len={len(final_text)} | preview={final_text[:200]!r}")
 
-        # Check for Final Answer
-        if "Final Answer:" in response:
-            final_part = response.split("Final Answer:")[1]
+            # Extract citations from final answer text
             citation_patterns = [
                 r'Art\.\s+\d+[a-z]?(?:\s+Abs\.\s+\d+)?\s+[A-Za-z]{2,}',
                 r'BGE\s+\d+\s+[IVX]+\s+\d+',
                 r'\d[A-Z]_\d+/\d{4}',
             ]
+            final_citations = []
             for pattern in citation_patterns:
-                matches = re.findall(pattern, final_part)
-                all_citations.update(matches)
+                matches = re.findall(pattern, final_text)
+                final_citations.extend(matches)
+
+            # Verify relevance of final answer citations one by one
+            if final_citations:
+                final_pairs = [(c, final_text) for c in set(final_citations)]
+                verified_final, discarded_final = _filter_relevant_citations(query, final_pairs)
+                all_citations.update(verified_final)
+            else:
+                verified_final, discarded_final = [], []
 
             logs.append({
                 "iteration": iteration + 1,
                 "action": "Final Answer",
-                "llm_response": response,
-                "conversation_snapshot": conversation,
+                "llm_response": final_text,
+                "final_citations_raw": final_citations,
+                "final_citations_verified": verified_final,
+                "final_citations_discarded": discarded_final,
             })
             break
 
-        # Execute action
-        if action_match and input_match:
-            action = action_match.group(1).strip()
-            action_input = input_match.group(1).strip()
+        # Execute each tool call (standard OpenAI tool-calling pattern)
+        for tool_call in message.tool_calls:
+            fn_name = tool_call.function.name
+            fn_args = json.loads(tool_call.function.arguments)
+            print(f"[Tool] {fn_name}({fn_args})")
 
             observation = ""
 
-            if action == "search_laws":
+            if fn_name == "search_laws":
+                action_input = fn_args["query"]
                 observation = law_tool.run(action_input)
-                law_citations = law_tool.get_last_citations()
-                all_citations.update(law_citations)
+                # Build (citation, full_text) pairs from last results
+                citation_text_pairs = [
+                    (doc.get("citation", ""), doc.get("text", ""))
+                    for doc in law_tool._last_results
+                    if doc.get("citation")
+                ]
+
+                # -- Relevance verification: one citation at a time --
+                verified_citations, discarded_citations = _filter_relevant_citations(query, citation_text_pairs)
+                all_citations.update(verified_citations)
+
+                if verbose and discarded_citations:
+                    print(f"  [Relevance filter] search_laws: kept {len(verified_citations)}/{len(citation_text_pairs)}, discarded: {discarded_citations}")
 
                 logs.append({
                     "iteration": iteration + 1,
                     "action": "search_laws",
                     "input": action_input,
-                    "llm_response": response,
                     "observation": observation,
-                    "found_citations": len(law_citations),
-                    "citation_list": list(law_citations),
+                    "found_citations": len(citation_text_pairs),
+                    "citation_list": [c for c, _ in citation_text_pairs],
+                    "verified_citations": verified_citations,
+                    "discarded_citations": discarded_citations,
                 })
 
-            elif action == "search_courts":
+            elif fn_name == "search_courts":
+                action_input = fn_args["query"]
                 results = court_tool.search_with_metadata(action_input)
 
-                court_citations = [r.get("citation", "") for r in results if r.get("citation")]
-                all_citations.update(court_citations)
+                # Build (citation, full_text) pairs for court decisions
+                court_pairs = [
+                    (r.get("citation", ""), r.get("text", ""))
+                    for r in results if r.get("citation")
+                ]
 
                 # Extract law citations from court decision texts
-                extracted_law_citations = set()
+                extracted_pairs: list[tuple[str, str]] = []
                 for court_doc in results[:10]:
                     court_text = court_doc.get("text", "")
                     law_cites = extract_citations_from_text(
                         court_text,
                         max_length=CONFIG["max_court_text_length"]
                     )
-                    extracted_law_citations.update(law_cites)
-
-                all_citations.update(extracted_law_citations)
+                    for lc in law_cites:
+                        extracted_pairs.append((lc, court_text))
 
                 observation = court_tool.run(action_input)
+                extracted_law_citations = set(c for c, _ in extracted_pairs)
                 if extracted_law_citations:
                     observation += f"\n\n[Extracted law citations from court texts: {', '.join(list(extracted_law_citations)[:5])}...]"
 
+                # -- Relevance verification: one citation at a time --
+                all_pairs = court_pairs + extracted_pairs
+                verified_citations, discarded_citations = _filter_relevant_citations(query, all_pairs)
+                all_citations.update(verified_citations)
+
+                if verbose and discarded_citations:
+                    print(f"  [Relevance filter] search_courts: kept {len(verified_citations)}/{len(all_pairs)}, discarded: {discarded_citations}")
+
+                court_citation_list = [c for c, _ in court_pairs]
                 logs.append({
                     "iteration": iteration + 1,
                     "action": "search_courts",
                     "input": action_input,
-                    "llm_response": response,
                     "observation": observation,
-                    "found_court_citations": len(court_citations),
-                    "court_citation_list": court_citations,
+                    "found_court_citations": len(court_citation_list),
+                    "court_citation_list": court_citation_list,
                     "extracted_law_citations": len(extracted_law_citations),
                     "extracted_law_citation_list": list(extracted_law_citations),
+                    "verified_citations": verified_citations,
+                    "discarded_citations": discarded_citations,
                 })
+
+            elif fn_name == "explore_citations":
+                action_input = fn_args["citation_id"]
+                if citation_explorer is not None:
+                    observation = citation_explorer.run(action_input)
+                    meta = citation_explorer.search_with_metadata(action_input)
+                    explorer_pairs: list[tuple[str, str]] = []
+                    for r in meta.get("inbound", []):
+                        explorer_pairs.append((r.get("id", ""), r.get("text", "")))
+                    for r in meta.get("outbound", []):
+                        explorer_pairs.append((r.get("id", ""), r.get("text", "")))
+
+                    verified_citations, discarded_citations = _filter_relevant_citations(query, explorer_pairs)
+                    all_citations.update(verified_citations)
+
+                    if verbose and discarded_citations:
+                        print(f"  [Relevance filter] explore_citations: kept {len(verified_citations)}/{len(explorer_pairs)}, discarded: {discarded_citations}")
+
+                    logs.append({
+                        "iteration": iteration + 1,
+                        "action": "explore_citations",
+                        "input": action_input,
+                        "observation": observation,
+                        "found_citations": len(explorer_pairs),
+                        "citation_list": [c for c, _ in explorer_pairs],
+                        "verified_citations": verified_citations,
+                        "discarded_citations": discarded_citations,
+                    })
+                else:
+                    observation = "explore_citations tool is not available (no graph database configured)."
+                    logs.append({
+                        "iteration": iteration + 1,
+                        "action": "explore_citations",
+                        "input": action_input,
+                        "observation": observation,
+                    })
+
             else:
-                observation = f"Unknown action: {action}"
+                observation = f"Unknown tool: {fn_name}"
                 logs.append({
                     "iteration": iteration + 1,
-                    "action": f"Unknown: {action}",
-                    "input": action_input,
-                    "llm_response": response,
+                    "action": f"Unknown: {fn_name}",
+                    "input": str(fn_args),
                     "observation": observation,
                 })
 
-            conversation += f" {response}\nObservation: {observation[:1000]}\nThought:"
-        else:
-            logs.append({
-                "iteration": iteration + 1,
-                "action": "Parse Error",
-                "llm_response": response,
-                "conversation_snapshot": conversation,
+            # Send tool result back to the LLM (standard tool-calling protocol)
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": observation,
             })
-            break
 
-    if verbose:
-        print("\n=== Full conversation ===")
-        print(conversation)
+        delay = CONFIG.get("rate_limit_delay", 0)
+        if delay > 0:
+            time.sleep(delay)
 
     return list(all_citations), logs
 
@@ -859,6 +1107,7 @@ def main():
             print("Building laws embedding index (for hybrid)...")
             laws_df = pd.read_csv(LAWS_CORPUS_PATH)
             documents = laws_df.to_dict("records")
+            documents = deduplicate_laws(documents, text_field="text", citation_field="citation")
 
             # --- Metadata enrichment (per-document, interleaved with embedding) ---
             enrich_fn = None
@@ -919,6 +1168,8 @@ def main():
             laws_df = pd.read_csv(LAWS_CORPUS_PATH)
             print(f"Loaded {len(laws_df)} law articles from {LAWS_CORPUS_PATH}")
             documents = laws_df.to_dict("records")
+            if index_type == "embedding":
+                documents = deduplicate_laws(documents, text_field="text", citation_field="citation")
 
             if index_type == "embedding":
                 # --- Metadata enrichment (per-document, interleaved with embedding) ---
@@ -981,6 +1232,7 @@ def main():
         courts_df = pd.read_csv(COURTS_CORPUS_PATH)
         print(f"Loaded {len(courts_df)} court decisions from {COURTS_CORPUS_PATH}")
         documents = courts_df.to_dict("records")
+        documents = deduplicate_laws(documents, text_field="text", citation_field="citation")
         courts_index = BM25Index(text_field="text", citation_field="citation")
         courts_index.build(documents)
         print("Saving index to cache...")
@@ -992,19 +1244,27 @@ def main():
     # ------------------------------------------------------------------
     law_tool = LawSearchTool(
         index=laws_index,
-        top_k=CONFIG["top_k_laws"],
-        max_excerpt_length=300,
+        threshold=CONFIG.get("threshold_laws", 0.3),
     )
 
     court_tool = CourtSearchTool(
         index=courts_index,
-        top_k=CONFIG["top_k_courts"],
-        max_excerpt_length=300,
+        threshold=CONFIG.get("threshold_courts", 0.3),
     )
+
+    # Citation explorer (requires Neo4j graph database)
+    citation_explorer = None
+    try:
+        graph_retriever = CitationGraphRetriever()
+        citation_explorer = CitationExplorerTool(graph_retriever=graph_retriever, top_k=5)
+        print("  - Citation explorer: connected to Neo4j graph")
+    except Exception as e:
+        print(f"  - Citation explorer: not available ({e})")
 
     print("Search tools initialized:")
     print(f"  - Law search: top_k={CONFIG['top_k_laws']}")
     print(f"  - Court search: top_k={CONFIG['top_k_courts']}")
+    print(f"  - Citation explorer: {'enabled' if citation_explorer else 'disabled'}")
 
     # Quick sanity test
     print("\nTesting law search:")
@@ -1020,79 +1280,47 @@ def main():
     backend = (CONFIG.get("llm_backend") or "openai").strip().lower()
     model_display = CONFIG.get("llm_model", CONFIG["model"]) if backend == "local_transformer" else CONFIG["model"]
     print(f"\nLLM client ready ({backend}). Model: {model_display}")
-    ENHANCED_AGENT_PROMPT = """Du bist ein Schweizer Rechtsrecherche-Assistent mit Zugang zu zwei Such-Tools:
+    ENHANCED_AGENT_PROMPT = """Du bist ein Schweizer Rechtsrecherche-Assistent. Du hast Zugang zu Such-Tools \
+die du über Funktionsaufrufe nutzen kannst.
 
-    1. search_laws(query): Durchsuche Schweizer Bundesgesetze (SR/Systematische Rechtssammlung)
-       - Gibt relevante Gesetzesbestimmungen mit Zitaten und Textauszügen zurück
-       - Verwende für Gesetzesrecht: Kodizes, Gesetze, Verordnungen
+WICHTIG: Suche IMMER auf Deutsch, da die Dokumente auf Deutsch sind.
 
-    2. search_courts(query): Durchsuche Schweizer Bundesgerichtsentscheide (BGE)
-       - Gibt relevante Rechtsprechung mit Zitaten und Auszügen zurück
-       - Verwende für Gerichtsentscheide und Präzedenzfälle
+STRATEGIE:
+1. Suche – Kandidaten aus dem Index abrufen (Gesetze UND Gerichtsentscheide)
+2. Relevanzprüfung – Nach JEDEM Tool-Aufruf die Ergebnisse auf Relevanz zur Anfrage prüfen. NUR relevante Ergebnisse behalten.
+3. Präzedenzfall-Analyse – Gesetzeszitate aus Gerichtsentscheiden extrahieren
+4. Zitationsnetzwerk – Mit explore_citations verwandte Gesetze und Entscheide über den Zitationsgraphen entdecken
 
-    WICHTIG: Suche IMMER auf Deutsch, da die Dokumente auf Deutsch sind.
+=== RELEVANZPRÜFUNG (KRITISCH) ===
+Nach JEDEM Tool-Aufruf MUSST du die zurückgegebenen Ergebnisse überprüfen:
+- Lies jeden zurückgegebenen Textauszug sorgfältig
+- Prüfe: Behandelt dieses Ergebnis tatsächlich das gleiche Rechtsthema wie die Anfrage?
+- BEHALTE nur Ergebnisse, deren Inhalt thematisch zur Anfrage passt
+- VERWERFE Ergebnisse, die zwar Suchbegriffe enthalten, aber ein anderes Rechtsgebiet behandeln
 
-    STRATEGIE:
-    1. Suche – Kandidaten aus dem Index abrufen
-    2. Präzedenzfall-Analyse – Gesetzeszitate aus Gerichtsentscheiden extrahieren
+Beispiel:
+Query: "Voraussetzungen für Untersuchungshaft"
+- RELEVANT: Art. 221 StPO über Haftgründe → behandelt direkt Untersuchungshaft
+- IRRELEVANT: Art. 59 StGB über therapeutische Massnahmen → anderes Thema
 
-    WARUM PRÄZEDENZFALL-ANALYSE WICHTIG IST:
-    Gerichtsentscheide zitieren die Gesetze, die sie anwenden. Durch das Finden relevanter 
-    Präzedenzfälle entdeckst du, welche Gesetze auf ähnliche rechtliche Fragestellungen 
-    anwendbar sind. Dies findet auch Gesetze, die nicht direkt mit den Suchbegriffen 
-    übereinstimmen, aber rechtlich relevant sind.
+WARUM PRÄZEDENZFALL-ANALYSE WICHTIG IST:
+Gerichtsentscheide zitieren die Gesetze, die sie anwenden. Durch relevante Präzedenzfälle \
+entdeckst du Gesetze, die nicht direkt mit den Suchbegriffen übereinstimmen, aber rechtlich relevant sind.
 
-    Anleitung:
-    - Durchsuche BEIDE: Gesetze UND Gerichtsentscheide
-    - Verwende mehrere Suchanfragen mit deutschen Rechtsbegriffen
-    - Achte auf Gesetzeszitate in den Gerichtsentscheiden (z.B. "Art. 221 StPO")
-    - Rufe die Tools auf bis alle relevanten Quellen gefunden sind
+WARUM ZITATIONSEXPLORATION WICHTIG IST:
+Mit explore_citations findest du verwandte Gesetze und Entscheide, die durch reine Textsuche \
+nicht gefunden werden.
 
-    Antwortformat:
-    Thought: [Deine Überlegung zur nächsten Suche]
-    Action: [tool_name]
-    Action Input: [deutsche Suchanfrage]
+Anleitung:
+- Durchsuche BEIDE: Gesetze UND Gerichtsentscheide
+- Verwende mehrere Suchanfragen mit deutschen Rechtsbegriffen
+- Achte auf Gesetzeszitate in den Gerichtsentscheiden (z.B. "Art. 221 StPO")
+- Verwende explore_citations um das Netzwerk relevanter Zitate zu erweitern
+- Rufe die Tools auf bis alle relevanten Quellen gefunden sind
 
-    === BEISPIELE ===
-
-    Beispiel 1 - Untersuchungshaft:
-    Query: What are the conditions for pretrial detention?
-
-    Thought: Ich suche nach Untersuchungshaft im Strafprozessrecht.
-    Action: search_laws
-    Action Input: Untersuchungshaft Voraussetzungen StPO
-
-    Observation: - Art. 221 Abs. 1 StPO: Untersuchungshaft ist zulässig...
-
-    Thought: Jetzt suche ich nach BGE-Entscheiden zur Untersuchungshaft, um weitere relevante Gesetze zu finden.
-    Action: search_courts
-    Action Input: Untersuchungshaft Haftgründe Verhältnismässigkeit
-
-    Observation: - BGE 137 IV 122: Zur Untersuchungshaft gemäss Art. 221 StPO und Art. 222 StPO...
-
-    Thought: Der BGE-Entscheid zitiert Art. 221 StPO und Art. 222 StPO. Ich habe alle drei Stufen abgeschlossen.
-    Final Answer: Art. 221 StPO, Art. 222 StPO, BGE 137 IV 122
-
-    Beispiel 2 - Vertragsrecht:
-    Query: What are the requirements for a valid contract?
-
-    Thought: Ich suche nach Vertragsvoraussetzungen im Obligationenrecht.
-    Action: search_laws
-    Action Input: Vertrag Abschluss Voraussetzungen OR
-
-    Observation: - Art. 1 Abs. 1 OR: Zum Abschluss eines Vertrages...
-
-    Thought: Jetzt suche ich nach Rechtsprechung zum Vertragsschluss.
-    Action: search_courts
-    Action Input: Vertragsabschluss Gültigkeit Willensmängel
-
-    Observation: - BGE 127 III 248: Zum Vertragsschluss nach Art. 1 OR, Art. 11 OR...
-
-    Thought: Der Entscheid zitiert Art. 1 OR und Art. 11 OR. Das sind relevante Gesetze.
-    Final Answer: Art. 1 OR, Art. 11 OR, BGE 127 III 248
-
-    Merke: Suche immer sowohl Gesetze ALS AUCH Gerichtsentscheide, um alle relevanten Zitate zu finden!
-    """
+Wenn du alle relevanten Quellen gesammelt hast, antworte mit einer Zusammenfassung \
+aller gefundenen relevanten Zitate. Liste alle relevanten Gesetzesartikel und \
+Gerichtsentscheide auf (z.B. Art. 221 StPO, BGE 137 IV 122)."""
 
     print("Enhanced agent prompt loaded (with three-stage retrieval strategy)")
 
@@ -1122,6 +1350,7 @@ def main():
             query_text,
             law_tool=law_tool,
             court_tool=court_tool,
+            citation_explorer=citation_explorer,
             verbose=False,
         )
         elapsed = time.time() - start_time

@@ -1,8 +1,11 @@
 """Neo4j local service management for the Omnilex citation graph.
 
-Manages a Homebrew-installed Neo4j instance (``brew install neo4j``).
+Manages a directly-installed Neo4j instance:
+- Linux (apt): apt install neo4j, uses systemctl
+- macOS: brew install neo4j, uses neo4j CLI
 """
 
+import shutil
 import subprocess
 import time
 
@@ -12,22 +15,35 @@ from neo4j.exceptions import ServiceUnavailable
 from .config import NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD
 
 
-def _brew(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["neo4j", *args], capture_output=True, text=True, check=check
-    )
+def _neo4j_start_cmd() -> list[str]:
+    """Return [cmd, ...] for starting Neo4j."""
+    if shutil.which("neo4j"):
+        return ["neo4j", "start"]
+    return ["systemctl", "start", "neo4j"]
+
+
+def _neo4j_stop_cmd() -> list[str]:
+    """Return [cmd, ...] for stopping Neo4j."""
+    if shutil.which("neo4j"):
+        return ["neo4j", "stop"]
+    return ["systemctl", "stop", "neo4j"]
+
+
+def _neo4j_status_cmd() -> list[str]:
+    """Return [cmd, ...] for checking Neo4j status."""
+    if shutil.which("neo4j"):
+        return ["neo4j", "status"]
+    return ["systemctl", "status", "neo4j"]
 
 
 def is_container_running() -> bool:
     """Check if the local Neo4j service is running."""
     r = subprocess.run(
-        ["neo4j", "status"], capture_output=True, text=True, check=False
+        _neo4j_status_cmd(), capture_output=True, text=True, check=False
     )
-    return "is running" in r.stdout.lower() or "is running" in r.stderr.lower()
-
-
-# Alias kept for backward-compat with __init__.py
-is_running = is_container_running
+    out = (r.stdout or "") + (r.stderr or "")
+    # neo4j CLI: "is running"; systemctl: "active (running)"
+    return "is running" in out.lower() or "active (running)" in out.lower()
 
 
 def check_health() -> bool:
@@ -54,18 +70,19 @@ def wait_for_ready(timeout: int = 60) -> bool:
     return False
 
 
-def start_neo4j(wait: bool = True, timeout: int = 60, **_kwargs) -> bool:
-    """Start the local Neo4j service (Homebrew install).
+# Alias kept for backward-compat with __init__.py
+is_running = is_container_running
 
-    Equivalent to ``neo4j start``.
-    """
+
+def start_neo4j(wait: bool = True, timeout: int = 60, **_kwargs) -> bool:
+    """Start the local Neo4j service (neo4j start)."""
     if is_container_running():
         print("Neo4j is already running.")
         return True
 
     print("Starting Neo4j (local)...")
     r = subprocess.run(
-        ["neo4j", "start"], capture_output=True, text=True, check=False
+        _neo4j_start_cmd(), capture_output=True, text=True, check=False
     )
     if r.returncode != 0:
         print(f"neo4j start failed: {r.stderr.strip() or r.stdout.strip()}")
@@ -81,7 +98,7 @@ def stop_neo4j() -> bool:
         return True
     print("Stopping Neo4j...")
     r = subprocess.run(
-        ["neo4j", "stop"], capture_output=True, text=True, check=False
+        _neo4j_stop_cmd(), capture_output=True, text=True, check=False
     )
     return r.returncode == 0
 

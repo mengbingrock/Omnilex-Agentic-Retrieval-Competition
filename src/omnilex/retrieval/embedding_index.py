@@ -460,6 +460,7 @@ class EmbeddingIndex:
         show_progress: bool = True,
         progress_desc: str = "Building embedding index",
         chunk_overlap_tokens: int = 0,
+        preprocess_fn=None,
     ) -> None:
         """Build embedding index from documents.
 
@@ -472,6 +473,8 @@ class EmbeddingIndex:
             show_progress: Show a progress bar while embedding (default True)
             progress_desc: Label for the progress bar
             chunk_overlap_tokens: Token overlap between consecutive chunks
+            preprocess_fn: Optional callable(doc) -> doc applied to each document
+                before embedding (e.g. metadata enrichment).
         """
         self.documents = []
         n_docs = len(documents)
@@ -485,6 +488,8 @@ class EmbeddingIndex:
                 doc_iter = tqdm(doc_iter, total=n_docs, unit="doc", desc=progress_desc)
 
             for _di, doc in doc_iter:
+                if preprocess_fn is not None:
+                    doc = preprocess_fn(doc)
                 text = doc.get(self.text_field, "")
                 chunks = self._chunk_text(text, overlap_tokens=chunk_overlap_tokens)
                 n_chunks = len(chunks)
@@ -519,6 +524,8 @@ class EmbeddingIndex:
                 doc_iter = tqdm(doc_iter, total=n_docs, unit="doc", desc=progress_desc)
 
             for _di, doc in doc_iter:
+                if preprocess_fn is not None:
+                    doc = preprocess_fn(doc)
                 text = doc.get(self.text_field, "")
                 chunks = self._chunk_text(text, overlap_tokens=chunk_overlap_tokens)
                 n_chunks = len(chunks)

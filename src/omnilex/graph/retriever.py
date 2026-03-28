@@ -223,7 +223,8 @@ class CitationGraphRetriever:
         """Return the top-*k* entities that cite *node_id*, ranked by edge weight.
 
         Works for both :Case and :Law nodes.  Each result dict carries
-        ``id``, ``type`` (``"Case"`` or ``"Law"``), ``rel_type``, ``weight``, ``tf``.
+        ``id``, ``type`` (``"Case"`` or ``"Law"``), ``rel_type``, ``weight``, ``tf``,
+        ``text``.
         """
         with self._driver.session() as s:
             result = s.run(
@@ -237,7 +238,8 @@ class CitationGraphRetriever:
                        labels(source)[0] AS type,
                        type(r) AS rel_type,
                        coalesce(r.weight, 0.0) AS weight,
-                       coalesce(r.tf, 0) AS tf
+                       coalesce(r.tf, 0) AS tf,
+                       coalesce(source.text, '') AS text
                 ORDER BY weight DESC
                 LIMIT $k
                 """,
@@ -250,7 +252,8 @@ class CitationGraphRetriever:
         """Return the top-*k* entities that *node_id* cites, ranked by edge weight.
 
         Works for both :Case and :Law nodes.  Each result dict carries
-        ``id``, ``type`` (``"Case"`` or ``"Law"``), ``rel_type``, ``weight``, ``tf``.
+        ``id``, ``type`` (``"Case"`` or ``"Law"``), ``rel_type``, ``weight``, ``tf``,
+        ``text``.
         """
         with self._driver.session() as s:
             result = s.run(
@@ -264,7 +267,8 @@ class CitationGraphRetriever:
                        labels(target)[0] AS type,
                        type(r) AS rel_type,
                        coalesce(r.weight, 0.0) AS weight,
-                       coalesce(r.tf, 0) AS tf
+                       coalesce(r.tf, 0) AS tf,
+                       coalesce(target.text, '') AS text
                 ORDER BY weight DESC
                 LIMIT $k
                 """,
